@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
 	int* pivots;
 	int* groupPivots = NULL;
 	int length;
-	int pivot;
+	int pivot = 0;
 
 	std::ifstream arrayInput;
 	std::ofstream solutionOutput;
@@ -122,12 +122,6 @@ int main(int argc, char** argv) {
 	int iterationsCount = (int) (log(size) / log(2));
 
 	pivots = new int[size];
-	
-	if (rank == 0) {
-		groupSizes = new int[(int)pow(2, iterationsCount - 1)];
-		groupOffsets = new int[(int)pow(2, iterationsCount - 1)];
-		groupPivots = new int[(int)pow(2, iterationsCount - 1)];
-	}
 
 	// start itme
 	auto start = chrono::high_resolution_clock::now();
@@ -137,69 +131,44 @@ int main(int argc, char** argv) {
 	}
 
 	for (int iteration = 0; iteration < iterationsCount; iteration++) {
-		if (rank == 0) {
-			int groupsCount = (int)pow(2, iteration);
-			
-			// fill in the groupSizes
-			int singleGroupPartCount = size / groupsCount;
-			for (int group = 0; group < groupsCount; group++) {
-				int groupStartPart = group * singleGroupPartCount;
-				int groupEnd = (group + 1) * singleGroupPartCount;
-				int groupSize = 0;
-				for (int part = groupStartPart; part < groupEnd; part++) {
-					groupSize += sizes[part];
-				}
-				groupSizes[group] = groupSize;
-			}
-
-			// fill in the groupPivots
-			zeroArray(groupOffsets, groupsCount);
-			for (int i = 1; i < groupsCount; i++) {
-				groupOffsets[i] = groupOffsets[i - 1] + groupSizes[i - 1];
-			}
-
-			for (int i = 0; i < groupsCount - 1; i++) {
-				groupPivots[i] = getPivot(array, groupOffsets[i], groupOffsets[i + 1]);
-			}
-			groupPivots[groupsCount - 1] = getPivot(array, groupOffsets[groupsCount - 1], length);
-
-			// fill in the pivots
-			int amountOfPartsPerGroup = size / groupsCount;
-			for (int r = 0; r < size; r++) {
-				int groupNumber = r / amountOfPartsPerGroup;
-				pivots[r] = groupPivots[groupNumber];
-			}
-		}
-
-		MPI_Bcast(sizes, size, MPI_INT, 0, MPI_COMM_WORLD);
-		MPI_Scatter(pivots, 1, MPI_INT, &pivot, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
+		
 		offsets[0] = 0;
 		for (int i = 1; i < size; i++) {
 			offsets[i] = offsets[i - 1] + sizes[i - 1];
 		}
 
-		MPI_Scatterv(array, sizes, offsets, MPI_INT, subArray, sizes[rank], MPI_INT, 0, MPI_COMM_WORLD);
+		int mySize;
+		int addSize;
+		int sendSize;
 
-		// DEBUG
-		/*
-		for (int i = 0; i < size; ++i) {
-			MPI_Barrier(MPI_COMM_WORLD);
-			if (i == rank) {
-				debugPrintArray("Array of Rank " + i, subArray, sizes[i], i);
-			}
+		MPI_Scatter(sizes, 1, MPI_INT, &mySize, 1, MPI_INT, 0, MPI_COMM_WORLD);
+		MPI_Scatterv(array, sizes, offsets, MPI_INT, subArray, mySize, MPI_INT, 0, MPI_COMM_WORLD);
+
+		// TODO
+		// 0 - [0], 1 - [0, 1], 2 - [0, 1, 2, 3] ...
+		int color = rank / ((int)pow(2, iterationsCount - iteration));
+		MPI_Comm LOCAL_MPI_COMM_WORLD;
+		MPI_Comm_split(MPI_COMM_WORLD, color, rank, &LOCAL_MPI_COMM_WORLD);
+		int localRank, localSize;
+		MPI_Comm_rank(LOCAL_MPI_COMM_WORLD, &localRank);
+		MPI_Comm_size(LOCAL_MPI_COMM_WORLD, &localSize);
+
+		if (localRank == 0) {
+			pivot = getPivot(subArray, 0, mySize);
 		}
-		*/
+
+		MPI_Bcast(&pivot, 1, MPI_INT, 0, LOCAL_MPI_COMM_WORLD);
 
 		// For 8 processes: 100 on it.0, 10 on it.1, 1 on it.2 
 		// For 4 processes: 10 on it.0, 1 on it.1
 		int checkBit = 1 << ((int)(log(size) / log(2)) - (iteration + 1));
 
-		int sendSize;
 		if (! (rank & checkBit)) {
-			MPI_Recv(&(subArray[sizes[rank]]), sizes[rank ^ checkBit], MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			// TODO Select main in group
+			MPI_Recv(&addSize, 1, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			MPI_Recv(&(subArray[mySize]), addSize, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-			int partLength = sizes[rank] + sizes[rank ^ checkBit];
+			int partLength = mySize + addSize;
 
 			int less = 0;
 			int greater = partLength - 1;
@@ -221,9 +190,11 @@ int main(int argc, char** argv) {
 
 			sendSize = less;
 		} else {
-			MPI_Send(subArray, sizes[rank], MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD);
+			MPI_Send(&mySize, 1, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD);
+			MPI_Send(subArray, mySize, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD);
 			MPI_Recv(&sendSize, 1, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 			MPI_Recv(subArray, sendSize, MPI_INT, rank ^ checkBit, 1000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			cout << rank << "/" << size << " (" << localRank << "/" << localSize << ") size = " << mySize << ": ";
 		}
 
 		// Last iteration 
@@ -248,9 +219,9 @@ int main(int argc, char** argv) {
 	if (rank == 0) {
 		cout << duration.count() << endl;
 		solutionOutput.open("C:\\university\\multithreading\\visual_studio\\qsort\\qsort_mpi\\qsort_mpi\\solution.txt");
-		//for (int i = 0; i < length; i++) {
-		//	solutionOutput << array[i] << " ";
-		//}
+		for (int i = 0; i < length; i++) {
+			solutionOutput << array[i] << " ";
+		}
 		solutionOutput.close();
 	}
 
